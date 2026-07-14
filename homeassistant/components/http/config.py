@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+from enum import StrEnum
 from ipaddress import ip_network
 import logging
 import os
@@ -67,14 +68,23 @@ def default_server_port() -> int:
 
 STORAGE_KEY: Final = DOMAIN
 STORAGE_VERSION: Final = 2
+STORAGE_VERSION_MINOR: Final = 2
 
 KEY_STABLE: Final = "stable"
 KEY_PENDING: Final = "pending"
 KEY_YAML_MIGRATION_DONE: Final = "yaml_migration_done"
+KEY_CONFIG_TO_LOAD: Final = "config_to_load"
 
 AUTO_REVERT_DELAY: Final = timedelta(minutes=5)
 
-DATA_STORE: HassKey[HTTPConfigStore] = HassKey(STORAGE_KEY)
+DATA_CONFIG: HassKey[HTTPConfig] = HassKey(STORAGE_KEY)
+
+
+class ConfigToLoad(StrEnum):
+    """Which stored HTTP config slot to load on startup."""
+
+    STABLE = "stable"
+    PENDING = "pending"
 
 
 class ConfData(TypedDict, total=False):
@@ -100,6 +110,7 @@ class _HTTPStoreData(TypedDict):
     stable: ConfData
     pending: ConfData | None
     yaml_migration_done: bool
+    config_to_load: ConfigToLoad
 
 
 def _ip_network_str(value: Any) -> str:
@@ -149,82 +160,24 @@ async def async_load_config(hass: HomeAssistant, config: ConfigType) -> ConfData
     - Recovery mode: always use ``stable`` so HA stays reachable after a bad
       config; YAML is ignored entirely (any pending YAML migration is
       deferred to the next normal boot).
-    - Normal mode: prefer ``pending`` if set, otherwise ``stable``.
+    - Normal mode: load whichever slot ``config_to_load`` points at (``pending``
+      while an unconfirmed config is being tried, ``stable`` once promoted or
+      auto-reverted).
     """
-    store = await async_get_and_load_store(hass)
-    if hass.config.recovery_mode:
-        _LOGGER.info("Recovery mode active; using stable HTTP config")
-        return store.stable
-
-    yaml_conf: ConfData | None = config.get(DOMAIN)
-    if store.yaml_migration_done:
-        if yaml_conf is not None:
-            # YAML is still present after migration completed; surface a repair
-            # issue so the user knows their YAML is being ignored.
-            ir.async_create_issue(
-                hass,
-                DOMAIN,
-                "yaml_still_present_after_migration",
-                is_fixable=False,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key="yaml_still_present_after_migration",
-            )
-        else:
-            # Clear any leftover deprecation issues if YAML was removed after migration.
-            ir.async_delete_issue(hass, DOMAIN, "deprecated_yaml_import_error")
-            ir.async_delete_issue(hass, DOMAIN, "deprecated_yaml")
-            ir.async_delete_issue(hass, DOMAIN, "yaml_still_present_after_migration")
-    else:
-        # Migrate YAML to storage and use it directly for this start. The
-        # migration function also marks the migration as done so future
-        # starts will ignore any remaining YAML.
-        conf_in_yaml = yaml_conf is not None
-        if yaml_conf is None:
-            yaml_conf = cast(ConfData, HTTP_STORAGE_SCHEMA({}))
-
-        try:
-            await store.async_migrate_yaml(yaml_conf)
-        except Exception:
-            _LOGGER.exception("Failed to migrate HTTP YAML configuration to storage")
-            ir.async_create_issue(
-                hass,
-                DOMAIN,
-                "deprecated_yaml_import_error",
-                is_fixable=False,
-                severity=ir.IssueSeverity.ERROR,
-                translation_key="deprecated_yaml_import_error",
-            )
-        else:
-            if conf_in_yaml:
-                ir.async_create_issue(
-                    hass,
-                    DOMAIN,
-                    "deprecated_yaml",
-                    breaks_in_ha_version="2027.6.0",
-                    is_fixable=False,
-                    severity=ir.IssueSeverity.WARNING,
-                    translation_key="deprecated_yaml",
-                )
-
-    if store.pending is not None:
-        _LOGGER.info("Using pending HTTP config")
-        store.async_schedule_revert_to_stable()
-        return store.pending
-
-    _LOGGER.info("Using stable HTTP config")
-    return store.stable
+    store = await async_get_config(hass)
+    return await store.async_load_config(config)
 
 
-async def async_get_and_load_store(hass: HomeAssistant) -> HTTPConfigStore:
-    """Return the singleton HTTP config store and load it."""
-    if (store := hass.data.get(DATA_STORE)) is None:
-        store = HTTPConfigStore(hass)
-        hass.data[DATA_STORE] = store
-    await store.async_load()
-    return store
+async def async_get_config(hass: HomeAssistant) -> HTTPConfig:
+    """Return the singleton HTTP config and load it."""
+    if (config := hass.data.get(DATA_CONFIG)) is None:
+        config = HTTPConfig(hass)
+        hass.data[DATA_CONFIG] = config
+    await config.async_load()
+    return config
 
 
-class HTTPConfigStore:
+class HTTPConfig:
     """Persist HTTP config as a stable/pending pair.
 
     ``stable`` holds the last config the user confirmed as working;
@@ -235,12 +188,13 @@ class HTTPConfigStore:
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize the store."""
+        """Initialize the config."""
         self._hass = hass
         self._store = _HTTPStore(
             hass,
             STORAGE_VERSION,
             STORAGE_KEY,
+            minor_version=STORAGE_VERSION_MINOR,
             private=True,
             atomic_writes=True,
         )
@@ -251,6 +205,12 @@ class HTTPConfigStore:
         self._load_lock = asyncio.Lock()
         self._revert_unsub: CALLBACK_TYPE | None = None
         self._revert_deadline: datetime | None = None
+        self._config_to_load: ConfigToLoad = ConfigToLoad.STABLE
+
+    @property
+    def active_config(self) -> ConfigToLoad:
+        """Return the config slot that is active for this boot."""
+        return self._config_to_load
 
     @property
     def stable(self) -> ConfData:
@@ -286,6 +246,13 @@ class HTTPConfigStore:
                 self._stable = raw[KEY_STABLE]
                 self._pending = raw[KEY_PENDING]
                 self._yaml_migration_done = raw[KEY_YAML_MIGRATION_DONE]
+                self._config_to_load = ConfigToLoad(raw[KEY_CONFIG_TO_LOAD])
+
+            if not self._pending and self._config_to_load == ConfigToLoad.PENDING:
+                # The store says to load pending, but no pending config exists;
+                # fall back to stable so we don't try to load a missing config.
+                self._config_to_load = ConfigToLoad.STABLE
+                await self._async_persist()
             self._loaded = True
 
     async def async_set_pending(self, config: ConfData | None) -> None:
@@ -312,13 +279,14 @@ class HTTPConfigStore:
         await self._async_persist()
 
     @callback
-    def async_schedule_revert_to_stable(self) -> None:
+    def _async_schedule_revert_to_stable(self) -> None:
         """Schedule reverting the pending config back to stable.
 
         Loading a pending config is a trial. If the user does not promote it
         within ``AUTO_REVERT_DELAY`` (e.g. because the new config made Home
-        Assistant unreachable), automatically clear it and restart so the last
-        known-good stable config is restored.
+        Assistant unreachable), automatically switch the active config back to
+        stable and restart so the last known-good config is restored. The
+        pending config itself is kept so it can still be inspected or retried.
         """
         self._async_cancel_revert()
         self._revert_deadline = dt_util.utcnow() + AUTO_REVERT_DELAY
@@ -345,7 +313,11 @@ class HTTPConfigStore:
         self._revert_deadline = None
 
     async def _async_revert_to_stable(self, _now: datetime) -> None:
-        """Clear the unconfirmed pending config and restart to apply stable."""
+        """Switch the active config back to stable and restart to apply it.
+
+        The pending config is kept on disk so
+        the user can still inspect or re-stage it after the revert.
+        """
         self._async_cancel_revert()
         if self._pending is None:
             return
@@ -354,8 +326,7 @@ class HTTPConfigStore:
             "stable config and restarting",
             AUTO_REVERT_DELAY,
         )
-        self._pending = None
-        await self._async_persist()
+        await self._async_persist(ConfigToLoad.STABLE)
         # Imported here to avoid a circular import at module load time.
         from homeassistant.components.homeassistant import (  # noqa: PLC0415
             DOMAIN as HASS_DOMAIN,
@@ -364,7 +335,7 @@ class HTTPConfigStore:
 
         await self._hass.services.async_call(HASS_DOMAIN, SERVICE_HOMEASSISTANT_RESTART)
 
-    async def async_migrate_yaml(self, config: ConfData) -> None:
+    async def _async_migrate_yaml(self, config: ConfData) -> None:
         """Migrate YAML config to storage as pending if not the same as the config used for recovery."""
         await self.async_load()
         validated_config = cast(ConfData, HTTP_STORAGE_SCHEMA(config))
@@ -372,15 +343,107 @@ class HTTPConfigStore:
         self._yaml_migration_done = True
         await self._async_persist()
 
-    async def _async_persist(self) -> None:
-        """Write the current state to disk (or remove the file if empty)."""
+    async def _async_validate_yaml_config(self, config: ConfigType) -> None:
+        yaml_conf: ConfData | None = config.get(DOMAIN)
+        if self._yaml_migration_done:
+            if yaml_conf is not None:
+                # YAML is still present after migration completed; surface a repair
+                # issue so the user knows their YAML is being ignored.
+                ir.async_create_issue(
+                    self._hass,
+                    DOMAIN,
+                    "yaml_still_present_after_migration",
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="yaml_still_present_after_migration",
+                )
+            else:
+                # Clear any leftover deprecation issues if YAML was removed after migration.
+                ir.async_delete_issue(
+                    self._hass, DOMAIN, "deprecated_yaml_import_error"
+                )
+                ir.async_delete_issue(self._hass, DOMAIN, "deprecated_yaml")
+                ir.async_delete_issue(
+                    self._hass, DOMAIN, "yaml_still_present_after_migration"
+                )
+        else:
+            # Migrate YAML to storage and use it directly for this start. The
+            # migration function also marks the migration as done so future
+            # starts will ignore any remaining YAML.
+            conf_in_yaml = yaml_conf is not None
+            if yaml_conf is None:
+                yaml_conf = cast(ConfData, HTTP_STORAGE_SCHEMA({}))
+
+            try:
+                await self._async_migrate_yaml(yaml_conf)
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to migrate HTTP YAML configuration to storage"
+                )
+                ir.async_create_issue(
+                    self._hass,
+                    DOMAIN,
+                    "deprecated_yaml_import_error",
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="deprecated_yaml_import_error",
+                )
+            else:
+                if conf_in_yaml:
+                    ir.async_create_issue(
+                        self._hass,
+                        DOMAIN,
+                        "deprecated_yaml",
+                        breaks_in_ha_version="2027.6.0",
+                        is_fixable=False,
+                        severity=ir.IssueSeverity.WARNING,
+                        translation_key="deprecated_yaml",
+                    )
+
+    async def _async_persist(self, config_to_load: ConfigToLoad | None = None) -> None:
+        """Write the current state to disk and update the config to load."""
+        if config_to_load is not None:
+            self._config_to_load = config_to_load
+        else:
+            self._config_to_load = (
+                ConfigToLoad.PENDING if self._pending else ConfigToLoad.STABLE
+            )
         await self._store.async_save(
             {
                 KEY_STABLE: self._stable,
                 KEY_PENDING: self._pending,
                 KEY_YAML_MIGRATION_DONE: self._yaml_migration_done,
+                KEY_CONFIG_TO_LOAD: self._config_to_load,
             }
         )
+
+    async def async_load_config(self, config: ConfigType) -> ConfData:
+        """Load the HTTP config to apply on this startup.
+
+        YAML config is only migrated once. Subsequent boots will ignore YAML and
+        use the store exclusively.
+
+        Resolution order:
+        - Recovery mode: always use ``stable`` so HA stays reachable after a bad
+          config; YAML is ignored entirely (any pending YAML migration is
+          deferred to the next normal boot).
+        - Normal mode: load whichever slot ``config_to_load`` points at. It
+          points at ``pending`` while an unconfirmed config is being tried and
+          at ``stable`` once that config is promoted or auto-reverted.
+        """
+        if self._hass.config.recovery_mode:
+            _LOGGER.info("Recovery mode active; using stable HTTP config")
+            return self._stable
+
+        await self._async_validate_yaml_config(config)
+
+        if self._config_to_load == ConfigToLoad.PENDING and self._pending is not None:
+            _LOGGER.info("Using pending HTTP config")
+            self._async_schedule_revert_to_stable()
+            return self._pending
+
+        _LOGGER.info("Using stable HTTP config")
+        return self._stable
 
 
 class _HTTPStore(Store[_HTTPStoreData]):
@@ -405,9 +468,17 @@ class _HTTPStore(Store[_HTTPStoreData]):
                     "falling back to defaults"
                 )
                 stable = _DEFAULT_CONFIG
-            return {
+            old_data = {
                 KEY_STABLE: stable,
                 KEY_PENDING: None,
                 KEY_YAML_MIGRATION_DONE: False,
             }
+            old_major_version = 2
+
+        if old_major_version == 2 and old_minor_version < 2:
+            # config_to_load was added in v2.2; default it from whether a pending
+            # config exists so existing installs keep booting the same slot.
+            old_data[KEY_CONFIG_TO_LOAD] = (
+                ConfigToLoad.PENDING if old_data[KEY_PENDING] else ConfigToLoad.STABLE
+            )
         return old_data

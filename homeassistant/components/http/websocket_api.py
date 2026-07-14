@@ -12,7 +12,7 @@ from homeassistant.components.homeassistant import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .config import HTTP_STORAGE_SCHEMA, async_get_and_load_store
+from .config import HTTP_STORAGE_SCHEMA, async_get_config
 from .const import ATTR_CONFIG
 
 
@@ -39,13 +39,14 @@ async def websocket_get_config(
     ``revert_at`` is when an unconfirmed pending config auto-reverts to
     stable, or ``None`` when no revert is scheduled.
     """
-    store = await async_get_and_load_store(hass)
+    store = await async_get_config(hass)
     connection.send_result(
         msg["id"],
         {
             "stable": store.stable,
             "pending": store.pending,
             "revert_at": store.revert_deadline,
+            "active_config": store.active_config,
         },
     )
 
@@ -69,10 +70,16 @@ async def websocket_set_config(
     refreshed. The result reports whether a restart was triggered via
     ``{"restart": bool}``.
     """
-    store = await async_get_and_load_store(hass)
+    store = await async_get_config(hass)
     previous_pending = store.pending
+    previous_active = store.active_config
     await store.async_set_pending(msg[ATTR_CONFIG])
-    restart = store.pending != previous_pending
+    # Restart when the config applied on the next boot changes: either the
+    # pending slot changed, or the active slot flipped (e.g. re-staging a config
+    # that had auto-reverted to stable while its pending copy was kept).
+    restart = (
+        store.pending != previous_pending or store.active_config != previous_active
+    )
     connection.send_result(msg["id"], {"restart": restart})
 
     if restart:
@@ -93,7 +100,7 @@ async def websocket_promote_config(
     working correctly with the pending config. The stable config is
     the one used by recovery mode, so promotion must be explicit.
     """
-    store = await async_get_and_load_store(hass)
+    store = await async_get_config(hass)
     try:
         await store.async_promote_pending()
     except HomeAssistantError as err:

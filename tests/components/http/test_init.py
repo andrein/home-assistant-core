@@ -352,23 +352,35 @@ async def test_peer_cert(hass: HomeAssistant, tmp_path: Path) -> None:
 
 
 def _stable_http_storage(
-    stable: dict, *, pending: dict | None = None, yaml_migration_done: bool = True
+    stable: dict,
+    *,
+    pending: dict | None = None,
+    yaml_migration_done: bool = True,
+    config_to_load: str | None = None,
 ) -> dict:
     """Build a hass_storage entry seeded with a confirmed-working stable config.
 
     ``stable`` (and ``pending`` if given) are normalised through the storage
     schema, matching what real users have on disk after migration / writes —
     the load path does direct key access and assumes the payload is complete.
+
+    ``config_to_load`` defaults to ``pending`` when a pending config is given,
+    otherwise ``stable``; pass it explicitly to seed states such as a pending
+    config that has already auto-reverted (pending kept, but stable is active).
     """
     normalised_stable = dict(HTTP_STORAGE_SCHEMA(stable))
     normalised_pending = dict(HTTP_STORAGE_SCHEMA(pending)) if pending else None
+    if config_to_load is None:
+        config_to_load = "pending" if normalised_pending else "stable"
     return {
         "version": 2,
+        "minor_version": 2,
         "key": DOMAIN,
         "data": {
             "stable": normalised_stable,
             "pending": normalised_pending,
             "yaml_migration_done": yaml_migration_done,
+            "config_to_load": config_to_load,
         },
     }
 
@@ -986,7 +998,7 @@ async def test_yaml_migration_failure_creates_error_issue(
     with (
         patch("asyncio.BaseEventLoop.create_server", return_value=Mock()),
         patch(
-            "homeassistant.components.http.config.HTTPConfigStore.async_migrate_yaml",
+            "homeassistant.components.http.config.HTTPConfig._async_migrate_yaml",
             side_effect=RuntimeError("boom"),
         ),
     ):
@@ -1294,6 +1306,7 @@ async def test_websocket_http_config(
         "stable": _DEFAULT_CONFIG,
         "pending": None,
         "revert_at": None,
+        "active_config": "stable",
     }
 
     new_config = {
@@ -1319,7 +1332,7 @@ async def test_websocket_http_config(
     assert len(restart_calls) == 1
 
     # Stable is unchanged until the user promotes, but the pending config is
-    # now returned alongside it.
+    # now returned alongside it and is the active slot for the next boot.
     await ws_client.send_json_auto_id({"type": "http/config"})
     response = await ws_client.receive_json()
     assert response["success"]
@@ -1327,6 +1340,7 @@ async def test_websocket_http_config(
         "stable": _DEFAULT_CONFIG,
         "pending": new_config,
         "revert_at": None,
+        "active_config": "pending",
     }
 
     # Promote: pending becomes stable, pending is cleared.
@@ -1343,6 +1357,7 @@ async def test_websocket_http_config(
         "stable": new_config,
         "pending": None,
         "revert_at": None,
+        "active_config": "stable",
     }
 
     # Promoting again with no pending is rejected.
@@ -1393,7 +1408,7 @@ async def test_pending_config_auto_reverts_to_stable(
         {"server_port": 9876}, pending={"server_port": 9999}
     )
 
-    # A revert clears the pending config and restarts to apply stable.
+    # A revert switches the active config back to stable and restarts to apply it.
     restart_calls = async_mock_service(hass, "homeassistant", "restart")
 
     # The revert deadline is anchored to the (frozen) load time.
@@ -1416,20 +1431,35 @@ async def test_pending_config_auto_reverts_to_stable(
         "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
         "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
         "revert_at": revert_at.isoformat(),
+        "active_config": "pending",
     }
 
-    # After the delay elapses without a promotion, pending is dropped and a
-    # restart is requested so the stable config is applied.
+    # After the delay elapses without a promotion, the active config switches
+    # back to stable and a restart is requested so it is applied. The pending
+    # config is kept on disk so the user can still inspect / retry it.
     freezer.tick(AUTO_REVERT_DELAY)
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
     assert hass_storage["http"]["data"] == {
         "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
-        "pending": None,
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
         "yaml_migration_done": True,
+        "config_to_load": "stable",
     }
     assert len(restart_calls) == 1
+
+    # The active config now reports stable and the revert deadline is cleared,
+    # while the reverted pending config remains available.
+    await ws_client.send_json_auto_id({"type": "http/config"})
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
+        "revert_at": None,
+        "active_config": "stable",
+    }
 
 
 async def test_pending_config_promote_cancels_revert(
@@ -1466,6 +1496,7 @@ async def test_pending_config_promote_cancels_revert(
         "stable": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
         "pending": None,
         "revert_at": None,
+        "active_config": "stable",
     }
 
     # The cancelled revert must not fire after the delay.
@@ -1477,8 +1508,171 @@ async def test_pending_config_promote_cancels_revert(
         "stable": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
         "pending": None,
         "yaml_migration_done": True,
+        "config_to_load": "stable",
     }
     assert len(restart_calls) == 0
+
+
+async def test_config_to_load_stable_keeps_pending_but_boots_stable(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A pending config that already auto-reverted boots from stable, not pending.
+
+    ``config_to_load`` is the source of truth for which slot is applied, so a
+    kept-but-inactive pending config must be ignored on boot and must not
+    schedule another auto-revert.
+    """
+    hass_storage["http"] = _stable_http_storage(
+        {"server_port": 9876},
+        pending={"server_port": 9999},
+        config_to_load="stable",
+    )
+
+    restart_calls = async_mock_service(hass, "homeassistant", "restart")
+
+    mock_server = Mock()
+    with patch(
+        "asyncio.BaseEventLoop.create_server", return_value=mock_server
+    ) as mock_create_server:
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    # Stable wins even though a pending config is present on disk.
+    args, _ = mock_create_server.call_args
+    assert args[2] == 9876
+
+    # The kept pending config is left untouched for the user to inspect / retry.
+    assert hass_storage["http"]["data"]["pending"] == HTTP_STORAGE_SCHEMA(
+        {"server_port": 9999}
+    )
+    assert hass_storage["http"]["data"]["config_to_load"] == "stable"
+
+    # Booting stable must not schedule an auto-revert, so no restart is queued.
+    freezer.tick(AUTO_REVERT_DELAY)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert len(restart_calls) == 0
+
+
+async def test_config_to_load_pending_without_pending_resets_to_stable(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """An inconsistent store (load pending, but no pending config) resets to stable."""
+    hass_storage["http"] = _stable_http_storage(
+        {"server_port": 9876},
+        config_to_load="pending",
+    )
+
+    mock_server = Mock()
+    with patch(
+        "asyncio.BaseEventLoop.create_server", return_value=mock_server
+    ) as mock_create_server:
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    args, _ = mock_create_server.call_args
+    assert args[2] == 9876
+    # The invalid config_to_load is corrected and persisted back to stable.
+    assert hass_storage["http"]["data"]["config_to_load"] == "stable"
+
+
+async def test_reconfigure_reverted_pending_triggers_restart(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Re-staging a config that auto-reverted must restart to apply it again.
+
+    After an auto-revert the pending slot is kept but inactive
+    (``config_to_load`` points at stable). Submitting the same config again must
+    flip the active slot back to pending and trigger a restart, even though the
+    pending payload itself is unchanged.
+    """
+    hass_storage["http"] = _stable_http_storage(
+        {"server_port": 9876},
+        pending={"server_port": 9999},
+        config_to_load="stable",
+    )
+
+    restart_calls = async_mock_service(hass, "homeassistant", "restart")
+
+    with patch("asyncio.BaseEventLoop.create_server", return_value=Mock()):
+        assert await async_setup_component(hass, "http", {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+
+    # The reverted pending config is present but inactive.
+    await ws_client.send_json_auto_id({"type": "http/config"})
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"]["active_config"] == "stable"
+    assert response["result"]["pending"] == HTTP_STORAGE_SCHEMA({"server_port": 9999})
+
+    # Re-stage the identical pending config: the payload is unchanged, but the
+    # active slot flips stable -> pending, so a restart must be requested.
+    await ws_client.send_json_auto_id(
+        {"type": "http/config/configure", "config": {"server_port": 9999}}
+    )
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"] == {"restart": True}
+    assert hass_storage["http"]["data"]["config_to_load"] == "pending"
+    await hass.async_block_till_done()
+    assert len(restart_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("pending", "expected_port", "expected_config_to_load"),
+    [
+        pytest.param(None, 9876, "stable", id="no-pending"),
+        pytest.param({"server_port": 9999}, 9999, "pending", id="with-pending"),
+    ],
+)
+async def test_setup_migrates_v2_store_without_config_to_load(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    pending: dict | None,
+    expected_port: int,
+    expected_config_to_load: str,
+) -> None:
+    """A pre-2.2 store (no config_to_load) is migrated, defaulting from pending.
+
+    Existing installs must keep booting the same slot they used before the
+    config_to_load field existed: pending if one was staged, otherwise stable.
+    """
+    normalised_pending = dict(HTTP_STORAGE_SCHEMA(pending)) if pending else None
+    hass_storage[DOMAIN] = {
+        "version": 2,
+        "key": DOMAIN,
+        "data": {
+            "stable": dict(HTTP_STORAGE_SCHEMA({"server_port": 9876})),
+            "pending": normalised_pending,
+            "yaml_migration_done": True,
+        },
+    }
+
+    mock_server = Mock()
+    with patch(
+        "asyncio.BaseEventLoop.create_server", return_value=mock_server
+    ) as mock_create_server:
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    args, _ = mock_create_server.call_args
+    assert args[2] == expected_port
+
+    assert hass_storage[DOMAIN]["version"] == 2
+    assert hass_storage[DOMAIN]["minor_version"] == 2
+    assert hass_storage[DOMAIN]["data"]["config_to_load"] == expected_config_to_load
 
 
 @pytest.mark.parametrize(
