@@ -182,9 +182,12 @@ class HTTPConfig:
 
     ``stable`` holds the last config the user confirmed as working;
     ``pending`` holds an unconfirmed config the user wants to try on
-    the next start. Normal startup prefers ``pending`` so the new
-    config gets exercised; recovery mode falls back to ``stable`` so
-    Home Assistant can still come up after a bad config.
+    the next start. ``config_to_load`` is the source of truth for which
+    slot boots: ``pending`` while an unconfirmed config is being tried,
+    ``stable`` once it is promoted or auto-reverted (the pending payload is
+    then kept for inspection/retry, but no longer booted). Recovery mode
+    always falls back to ``stable`` so Home Assistant can still come up
+    after a bad config.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -267,11 +270,19 @@ class HTTPConfig:
     async def async_promote_pending(self) -> None:
         """Promote the pending config to stable.
 
-        Raises ``HomeAssistantError`` if there is nothing to promote.
+        Raises ``HomeAssistantError`` if there is nothing to promote, or if the
+        pending config is not the active one (e.g. it already auto-reverted, so
+        Home Assistant is running stable and the pending config was never
+        confirmed working).
         """
         await self.async_load()
         if self._pending is None:
             raise HomeAssistantError("No pending HTTP config to promote")
+        if self._config_to_load is not ConfigToLoad.PENDING:
+            raise HomeAssistantError(
+                "Cannot promote a pending HTTP config that is not active; "
+                "re-stage it first"
+            )
         self._stable = self._pending
         self._pending = None
         # The config is now confirmed; no need to revert it anymore.

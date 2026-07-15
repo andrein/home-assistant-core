@@ -1645,6 +1645,85 @@ async def test_reconfigure_reverted_pending_triggers_restart(
     assert len(restart_calls) == 1
 
 
+async def test_promote_reverted_pending_is_rejected(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Promoting a kept-but-inactive pending config is rejected.
+
+    After an auto-revert Home Assistant runs stable while the failed pending
+    payload is only kept for inspection, so promoting it would overwrite the
+    known-good stable slot with a config that was never confirmed working.
+    """
+    hass_storage["http"] = _stable_http_storage(
+        {"server_port": 9876},
+        pending={"server_port": 9999},
+        config_to_load="stable",
+    )
+
+    with patch("asyncio.BaseEventLoop.create_server", return_value=Mock()):
+        assert await async_setup_component(hass, "http", {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+
+    await ws_client.send_json_auto_id({"type": "http/config/promote"})
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "not_allowed"
+
+    # The stable slot and the kept pending config are both left untouched.
+    assert hass_storage["http"]["data"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
+        "yaml_migration_done": True,
+        "config_to_load": "stable",
+    }
+
+
+async def test_clear_reverted_pending_does_not_restart(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Clearing a kept-but-inactive pending config does not restart.
+
+    Stable is already the booting slot, so dropping the auto-reverted pending
+    payload leaves the next-boot config unchanged.
+    """
+    hass_storage["http"] = _stable_http_storage(
+        {"server_port": 9876},
+        pending={"server_port": 9999},
+        config_to_load="stable",
+    )
+
+    restart_calls = async_mock_service(hass, "homeassistant", "restart")
+
+    with patch("asyncio.BaseEventLoop.create_server", return_value=Mock()):
+        assert await async_setup_component(hass, "http", {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+
+    await ws_client.send_json_auto_id({"type": "http/config/configure", "config": None})
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"] == {"restart": False}
+    assert hass_storage["http"]["data"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": None,
+        "yaml_migration_done": True,
+        "config_to_load": "stable",
+    }
+    await hass.async_block_till_done()
+    assert len(restart_calls) == 0
+
+
 @pytest.mark.parametrize(
     ("pending", "expected_port", "expected_config_to_load"),
     [

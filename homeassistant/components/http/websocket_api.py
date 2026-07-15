@@ -12,7 +12,13 @@ from homeassistant.components.homeassistant import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .config import HTTP_STORAGE_SCHEMA, async_get_config
+from .config import (
+    HTTP_STORAGE_SCHEMA,
+    ConfData,
+    ConfigToLoad,
+    HTTPConfig,
+    async_get_config,
+)
 from .const import ATTR_CONFIG
 
 
@@ -22,6 +28,13 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_get_config)
     websocket_api.async_register_command(hass, websocket_set_config)
     websocket_api.async_register_command(hass, websocket_promote_config)
+
+
+def _get_config(store: HTTPConfig) -> ConfData | None:
+    """Return the config slot that will be applied on the next boot."""
+    if store.active_config is ConfigToLoad.PENDING:
+        return store.pending
+    return store.stable
 
 
 @websocket_api.require_admin
@@ -66,20 +79,15 @@ async def websocket_set_config(
 ) -> None:
     """Store a new pending HTTP configuration and restart to apply it.
 
-    Restart whenever the pending slot changes, so the runtime config is
-    refreshed. The result reports whether a restart was triggered via
-    ``{"restart": bool}``.
+    Restart only when the if the config would change the active config. The result
+    reports whether a restart was triggered via ``{"restart": bool}``.
     """
     store = await async_get_config(hass)
-    previous_pending = store.pending
-    previous_active = store.active_config
+    # Store the current config before setting the pending config, so we can
+    # determine if the active config will change and a restart is needed.
+    current_config = _get_config(store)
     await store.async_set_pending(msg[ATTR_CONFIG])
-    # Restart when the config applied on the next boot changes: either the
-    # pending slot changed, or the active slot flipped (e.g. re-staging a config
-    # that had auto-reverted to stable while its pending copy was kept).
-    restart = (
-        store.pending != previous_pending or store.active_config != previous_active
-    )
+    restart = _get_config(store) != current_config
     connection.send_result(msg["id"], {"restart": restart})
 
     if restart:
