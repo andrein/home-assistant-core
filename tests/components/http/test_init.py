@@ -1545,10 +1545,12 @@ async def test_config_to_load_stable_keeps_pending_but_boots_stable(
     assert args[2] == 9876
 
     # The kept pending config is left untouched for the user to inspect / retry.
-    assert hass_storage["http"]["data"]["pending"] == HTTP_STORAGE_SCHEMA(
-        {"server_port": 9999}
-    )
-    assert hass_storage["http"]["data"]["config_to_load"] == "stable"
+    assert hass_storage["http"]["data"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
+        "yaml_migration_done": True,
+        "config_to_load": "stable",
+    }
 
     # Booting stable must not schedule an auto-revert, so no restart is queued.
     freezer.tick(AUTO_REVERT_DELAY)
@@ -1578,7 +1580,12 @@ async def test_config_to_load_pending_without_pending_resets_to_stable(
     args, _ = mock_create_server.call_args
     assert args[2] == 9876
     # The invalid config_to_load is corrected and persisted back to stable.
-    assert hass_storage["http"]["data"]["config_to_load"] == "stable"
+    assert hass_storage["http"]["data"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": None,
+        "yaml_migration_done": True,
+        "config_to_load": "stable",
+    }
 
 
 async def test_reconfigure_reverted_pending_triggers_restart(
@@ -1613,8 +1620,12 @@ async def test_reconfigure_reverted_pending_triggers_restart(
     await ws_client.send_json_auto_id({"type": "http/config"})
     response = await ws_client.receive_json()
     assert response["success"]
-    assert response["result"]["active_config"] == "stable"
-    assert response["result"]["pending"] == HTTP_STORAGE_SCHEMA({"server_port": 9999})
+    assert response["result"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
+        "revert_at": None,
+        "active_config": "stable",
+    }
 
     # Re-stage the identical pending config: the payload is unchanged, but the
     # active slot flips stable -> pending, so a restart must be requested.
@@ -1624,7 +1635,12 @@ async def test_reconfigure_reverted_pending_triggers_restart(
     response = await ws_client.receive_json()
     assert response["success"]
     assert response["result"] == {"restart": True}
-    assert hass_storage["http"]["data"]["config_to_load"] == "pending"
+    assert hass_storage["http"]["data"] == {
+        "stable": HTTP_STORAGE_SCHEMA({"server_port": 9876}),
+        "pending": HTTP_STORAGE_SCHEMA({"server_port": 9999}),
+        "yaml_migration_done": True,
+        "config_to_load": "pending",
+    }
     await hass.async_block_till_done()
     assert len(restart_calls) == 1
 
@@ -1670,9 +1686,17 @@ async def test_setup_migrates_v2_store_without_config_to_load(
     args, _ = mock_create_server.call_args
     assert args[2] == expected_port
 
-    assert hass_storage[DOMAIN]["version"] == 2
-    assert hass_storage[DOMAIN]["minor_version"] == 2
-    assert hass_storage[DOMAIN]["data"]["config_to_load"] == expected_config_to_load
+    assert hass_storage[DOMAIN] == {
+        "version": 2,
+        "minor_version": 2,
+        "key": DOMAIN,
+        "data": {
+            "stable": dict(HTTP_STORAGE_SCHEMA({"server_port": 9876})),
+            "pending": normalised_pending,
+            "yaml_migration_done": True,
+            "config_to_load": expected_config_to_load,
+        },
+    }
 
 
 @pytest.mark.parametrize(
