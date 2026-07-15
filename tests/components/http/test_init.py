@@ -998,7 +998,7 @@ async def test_yaml_migration_failure_creates_error_issue(
     with (
         patch("asyncio.BaseEventLoop.create_server", return_value=Mock()),
         patch(
-            "homeassistant.components.http.config.HTTPConfig._async_migrate_yaml",
+            "homeassistant.components.http.config._HTTPStore.async_save",
             side_effect=RuntimeError("boom"),
         ),
     ):
